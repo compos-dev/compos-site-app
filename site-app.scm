@@ -56,9 +56,13 @@
   (set! *site-apps* (alist-put *site-apps* name spec)) spec)
 
 (define (site-app-tab-key name)
-  ;; one tab per app in each browser window: the window this frame shows in
-  (let ((w (chrome-window-resolve!)))
-    (string-append (symbol->string name) "@" (if w (number->string w) ""))))
+  ;; one tab per app in the profile the group is pinned to, else in each
+  ;; browser window: the window this frame shows in
+  (let ((p (and (boundp 'chrome-group-profile) (chrome-group-profile))))
+    (if p
+        (string-append (symbol->string name) "@" p)
+        (let ((w (chrome-window-resolve!)))
+          (string-append (symbol->string name) "@" (if w (number->string w) ""))))))
 
 (define (site-app-tab name)
   (let ((hit (assoc (site-app-tab-key name) *site-app-tabs*))) (and hit (cadr hit))))
@@ -103,6 +107,10 @@
           (unless (minor-mode-on? buf mode) (enable-minor-mode! buf mode)))
         (unless (buffer-derived-mode? buf mode)
           (with-current-buffer buf (lambda () (set-mode! mode)))))
+    ;; imenu names the rows by what they are, and opens on them
+    (buffer-set-local! buf 'imenu-index-function 'site-app-index-imenu)
+    (buffer-set-local! buf 'imenu-tab
+      (site-app-noun (plist-get (site-app-page (site-app-spec name) pid) 'label)))
     buf))
 (define (site-app-pages spec) (or (plist-get spec 'pages) '()))
 
@@ -437,7 +445,9 @@
         (set! *site-app-opening* (alist-put *site-app-opening* key (cons k (cadr waiting))))
         (chrome-call "tabs" (chrome-here '())
           (lambda (reply)
-            (let* ((tabs (filter (lambda (tab) (or (not win) (equal? (plist-get tab 'window) win)))
+            ;; pinned to a profile, any of its windows holds the tab: the reply is that profile's
+            (let* ((tabs (filter (lambda (tab) (or (not win) (and (boundp 'chrome-group-profile) (chrome-group-profile))
+                                                     (equal? (plist-get tab 'window) win)))
                                  (or (plist-get reply 'tabs) '())))
                    (live (and remembered
                              (site-app-find
@@ -471,6 +481,22 @@
          (pages (site-app-pages spec)))
     (when (< index (length pages))
       (site-app-open! (plist-get spec 'name) (plist-get (list-ref pages index) 'id)))))
+
+(define (site-app-section-step! delta)
+  ;; the section DELTA away from this list's, round the navbar
+  (let* ((buf (current-buffer))
+         (pages (site-app-pages (site-app-get buf 'spec)))
+         (here (site-app-get buf 'page))
+         (n (length pages))
+         (i (let loop ((ps pages) (i 0))
+              (cond ((null? ps) 0) ((equal? (plist-get (car ps) 'id) here) i) (else (loop (cdr ps) (+ i 1)))))))
+    (when (> n 0) (site-app-select-page! (modulo (+ i delta) n)))))
+
+(define-command "site-app-section-next" "Show the next section of this website app"
+  (lambda () (site-app-section-step! 1)))
+
+(define-command "site-app-section-prev" "Show the previous section of this website app"
+  (lambda () (site-app-section-step! -1)))
 
 (define (site-app-filter-step! delta)
   ;; walk the section's status tabs, then read the section at the new one
@@ -1718,6 +1744,54 @@
   (let ((id (site-app-detail-active buf)))
     (lambda () (unless (equal? (site-app-detail-active buf) id) (site-app-detail-select! buf id)))))
 
+(define (site-app-one-line s)
+  ;; a doc imenu can choose by: one line, cut short
+  (let ((t (string-join (filter (lambda (w) (not (equal? w ""))) (string-split (string-replace (or s "") "\n" " ") " ")) " ")))
+    (if (> (string-length t) 90) (string-append (substring t 0 89) "…") t)))
+
+(define (site-app-noun label)
+  ;; a section's label as one of its rows: Companies -> company
+  (let ((s (string-downcase (or label "item"))))
+    (cond ((string-suffix? "ies" s) (string-append (substring s 0 (- (string-length s) 3)) "y"))
+          ((string-suffix? "s" s) (substring s 0 (- (string-length s) 1)))
+          (else s))))
+
+(define (site-app-index-imenu buf)
+  ;; a list's imenu: each row by the name a reader knows it by, its kind the
+  ;; section's noun, its doc the other columns, labelled. The tabs follow
+  ;; (imenu adds them)
+  (let* ((spec (site-app-spec (plist-get (site-app-get buf 'spec) 'name)))
+         (page (site-app-current-page buf))
+         (noun (site-app-noun (and page (plist-get page 'label))))
+         (namer (and spec (plist-get spec 'detail-name)))
+         (cols (or (and page (plist-get page 'columns)) '()))
+         (named (or (find (lambda (c) (eq? (plist-get c 'field) 'name)) cols) (and (pair? cols) (car cols))))
+         (others (filter (lambda (c) (not (eq? c named))) cols)))
+    (with-current-buffer buf
+      (lambda ()
+        (let loop ((os (list-offsets buf)) (es (list-entries buf)) (acc '()))
+          (if (or (null? os) (null? es))
+              (reverse acc)
+              (let* ((row (car es))
+                     (name (or (and namer (namer row)) (and named (site-app-field row (plist-get named 'field))) ""))
+                     (doc (string-join
+                            (filter (lambda (s) s)
+                                    (map (lambda (c)
+                                           (let ((v (string-trim (site-app-field row (plist-get c 'field)))))
+                                             (and (not (equal? v "")) (string-append (plist-get c 'label) " " v))))
+                                         others))
+                            " · ")))
+                (loop (cdr os) (cdr es)
+                      (if (equal? (string-trim name) "") acc
+                          (cons (list (line-number-at-pos (car os)) noun name (site-app-one-line doc)) acc))))))))))
+
+(define (site-app-imenu-tidy rows)
+  ;; every entry has a kind, part unless it says, and a one-line doc
+  (map (lambda (r)
+         (append (list (car r) (if (equal? (cadr r) "") "part" (cadr r)) (caddr r) (site-app-one-line (cadddr r)))
+                 (list-tail r 4)))
+       rows))
+
 (define (site-app-imenu-rows buf)
   (let* ((spec (site-app-spec (site-app-get buf 'name)))
          (rename (site-app-imenu-rename spec))
@@ -1726,7 +1800,7 @@
          (tabs (site-app-detail-tabs buf))
          ;; each tab's key, as the page's own: the site's tabs from 1, composed ones before
          (first (- 1 (length (filter (lambda (t) (plist-get t 'composed)) tabs)))))
-    (append
+    (site-app-imenu-tidy (append
       (anchor-entry-rows buf (anchor-block-entries (or (site-app-get buf 'index-head) '())) (list 'rename rename))
       (apply append
         (map (lambda (t)
@@ -1738,7 +1812,7 @@
                       (take (lambda () (unless (equal? (site-app-detail-active buf) id) (site-app-detail-select! buf id))))
                       (go (lambda (e) (lambda () (take) (site-app-imenu-goto! buf (nth 4 e)))))
                       (key (number->string (+ first (- (length tabs) (length (member t tabs)))))))
-                 (cons (list tab-line "" label "" (lambda () (take) (buffer-goto-line! buf tab-line) (anchor-sync! buf)) "" key)
+                 (cons (list tab-line "tab" label "" (lambda () (take) (buffer-goto-line! buf tab-line) (anchor-sync! buf)) "" key)
                        (if here?
                            (anchor-entry-rows buf (site-app-imenu-cut spec id (anchor-block-entries (or (site-app-get buf 'index-body) '())))
                                               (list 'rename rename 'depth 1 'where label 'target go))
@@ -1748,7 +1822,7 @@
                                  (anchor-entry-rows buf (site-app-imenu-cut spec id (anchor-block-entries (car built)))
                                    (list 'rename rename 'depth 1 'where label 'text (cadr built) 'line tab-line
                                          'target go))))))))
-             tabs)))))
+             tabs))))))
 
 (define (site-app-draw! buf)
   (set! *site-app-folding* buf)
@@ -2582,6 +2656,9 @@
         ;; as on the list beside it
         (list "M-<right>" "site-app-detail-next-tab")
         (list "M-<left>" "site-app-detail-prev-tab")
+        ;; the tabs across the top, as every app's
+        (list "<right>" "site-app-detail-next-tab")
+        (list "<left>" "site-app-detail-prev-tab")
         (list "t" "site-app-tabs")
         (list "s" "site-app-sections")
         (list "<down>" "site-app-detail-next")
@@ -2710,13 +2787,16 @@
         'head-blocks (lambda (b) (site-app-list-head-blocks b))
         'preview site-app-show-detail!
         'debounce #t
-        'footer (lambda (b) (append (map (lambda (k) (list (car k) (caddr k))) list-keys) (list (list "1–5" "sections") (list "6–0" "page tabs") (list "/" "any tab") (list "[ ]" "status") (list "M-↑↓" "page parts") (list "M-←→" "page tabs")
+        'footer (lambda (b) (append (map (lambda (k) (list (car k) (caddr k))) list-keys) (list (list "←→" "sections") (list "1–5" "sections") (list "6–0" "page tabs") (list "/" "any tab") (list "[ ]" "status") (list "M-↑↓" "page parts") (list "M-←→" "page tabs")
                                     (list "g" "refresh") (list "q" "quit"))))
         ;; The digits are the tab bars' (tab-bars.scm): 1-5 the sections,
         ;; 6-0 the page beside the list. M-digit still takes a section.
         'keys (append (list (list "RET" "site-app-detail")
                             (list "t" "site-app-tabs")
                             (list "s" "site-app-sections")
+                            ;; the sections across the top, as every app's tabs
+                            (list "<left>" "site-app-section-prev")
+                            (list "<right>" "site-app-section-next")
                             (list "[" "site-app-filter-prev")
                             (list "]" "site-app-filter-next")
                             (list "g" "site-app-refresh")

@@ -356,6 +356,9 @@
       ;; a company has tabs of its own, each read from its ?tab= URL; the earlier
       ;; keys win over the plain page that ats-section reads
       (list 'detail-sheet (ats-sheet "company-detail.xsl")
+            ;; the site's Active, Approved, All and Unapproved: LiveView buttons
+            ;; that set ?tab=, read as the status tabs [ and ] step
+            'tabs-sheet (ats-sheet "companies-tabs.xsl")
             'detail-fetch #f
             'detail-tab-param "tab"
             'detail-tabs (map (lambda (id) (list 'id id)) '("overview" "subscriptions")))
@@ -1337,3 +1340,53 @@ An agent that calls it becomes the chat's parent: the chat's answers wake it."
 (mode-keys! "ats-draft-mode" '(("C-c C-c" "ats-draft-save") ("C-c C-k" "ats-draft-abort")))
 (mode-doc! "ats-draft-mode" "An approval's candidate-facing draft. C-c C-c saves it to the site, C-c C-k drops it.")
 
+
+
+;; A todo filed from the ATS names its source "ats:KIND:ID", KIND one of
+;; applications, candidates, jobs, approvals, companies: `o` on the task's
+;; page opens that page beside it.
+(define (ats--todo-source-open! key)
+  (let* ((rest (substring key 4 (string-length key)))
+         (i (string-index rest ":"))
+         (kind (string->symbol (substring rest 0 i)))
+         (id (substring rest (+ i 1) (string-length rest))))
+    (display-buffer-other-window! (ats-show! kind id #f #t))))
+
+(define (ats--register-todo-source!)
+  ;; older todo packages only; the current one has no source openers
+  (when (boundp 'todo-source-opener-register!)
+    (todo-source-opener-register! "ats:" ats--todo-source-open!)))
+(if (featurep 'todo) (ats--register-todo-source!) (with-eval-after-load 'todo ats--register-todo-source!))
+
+;; The todo list groups by client too: `<` in *Todos* adds a client
+;; section, the rest of a task's first client_ or application_ tag, so
+;; client_thine and application_thine both land in thine. ats overrides
+;; todo's own section-of rather than asking todo for a hook.
+(define ats-todo-client-prefixes '("client_" "application_"))
+
+(define (ats--todo-client t)
+  (let loop ((tags (or (plist-get t 'tags) '())))
+    (if (null? tags)
+        "no client"
+        (let ((p (find (lambda (p) (string-prefix? p (car tags))) ats-todo-client-prefixes)))
+          (if (and p (> (string-length (car tags)) (string-length p)))
+              (substring (car tags) (string-length p) (string-length (car tags)))
+              (loop (cdr tags)))))))
+
+(define (ats--todo-client-grouping!)
+  ;; keep todo's own section-of once, so a reload of ats does not wrap it twice
+  (unless (and (boundp 'ats--todo-section-of-base) ats--todo-section-of-base)
+    (set! ats--todo-section-of-base todo--section-of))
+  (set! todo--section-of
+        (lambda (buf t)
+          (if (equal? (todo--grouping buf) "client")
+              (ats--todo-client t)
+              (ats--todo-section-of-base buf t))))
+  (unless (member "client" *todo-groupings*)
+    (set! *todo-groupings*
+          (let loop ((gs *todo-groupings*))
+            (cond ((null? gs) (list "client"))
+                  ((equal? (car gs) "status") (cons "client" gs))
+                  (else (cons (car gs) (loop (cdr gs)))))))))
+(define ats--todo-section-of-base (if (boundp 'ats--todo-section-of-base) ats--todo-section-of-base #f))
+(if (featurep 'todo) (ats--todo-client-grouping!) (with-eval-after-load 'todo ats--todo-client-grouping!))
