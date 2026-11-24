@@ -765,13 +765,22 @@
            (site-app-claim blk n n name)))
        (filter pair? blocks)))
 
+(define (amazon--product-doc row)
+  ;; the Product part's line in imenu: what it costs, its stars and when it lands
+  (let ((c (if row (amazon--cells-of row) '())))
+    (string-join (filter (lambda (s) (and s (not (equal? s ""))))
+                         (list (plist-get c 'pay)
+                               (let ((s (plist-get c 'stars))) (and s (not (equal? s "")) (string-append "★ " s)))
+                               (plist-get c 'lands)))
+                 " · ")))
+
 (define (amazon--tab id label blocks)
   ;; a tab of a product's page, drawn from the row and the product page: the
   ;; hero over it, then the tab's own parts
   (list 'id id 'label label 'from '()
         'draw (lambda (buf b)
                 (let ((row (site-app-get buf 'row)))
-                  (amazon--claimed b (cons (append (amazon--head-block row buf) (list 'imenu-name "Product"))
+                  (amazon--claimed b (cons (append (amazon--head-block row buf) (list 'imenu-name "Product" 'anchor-data (list 'kind "part" 'doc (amazon--product-doc row))))
                                            (blocks buf row)))))))
 
 (define *amazon-tabs*
@@ -882,8 +891,15 @@
       (buffer-set-local! buf 'list-layout-cache #f)
       (list-refresh! buf))))
 
+(define (amazon--unique rows)
+  ;; Amazon repeats a product across its result slots; keep the first of each ASIN
+  (let loop ((rs rows) (seen '()) (acc '()))
+    (cond ((null? rs) (reverse acc))
+          ((let ((a (plist-get (car rs) 'asin))) (and a (member a seen))) (loop (cdr rs) seen acc))
+          (else (loop (cdr rs) (cons (plist-get (car rs) 'asin) seen) (cons (car rs) acc))))))
+
 (define (amazon--fill! buf rows)
-  (buffer-set-local! buf 'amazon-rows (map amazon--keyed rows))
+  (buffer-set-local! buf 'amazon-rows (map amazon--keyed (amazon--unique rows)))
   (amazon--redraw! buf))
 
 (define (amazon--cart-marks! rows)
@@ -1336,7 +1352,7 @@
 (defcomponent 'amazon/search-bar
   "The search field over the listing: a magnifier, the query or the prompt to search, and its key. A click, like the key, asks for a search; ACTIVE? marks it while the prompt is open, its query what you type."
   '((query string optional) (click string optional) (key string optional) (active? boolean optional))
-  '(query "scientific calculator" click "amazon:amazon-search" key "/")
+  '(query "scientific calculator" click "amazon:amazon-search" key "S")
   (lambda (p)
     (let ((q (component--get p 'query "")))
       (list 'tag "div" 'class (if (component--get p 'active? #f) "amz-search amz-search-active" "amz-search")
@@ -1344,7 +1360,7 @@
             'children (list (amz--text "amz-search-icon" "⌕")
                             (amz--text (if (equal? q "") "amz-search-text amz-search-empty" "amz-search-text")
                                        (if (equal? q "") "Search Amazon" q))
-                            (amz--text "amz-key" (component--get p 'key "/")))))))
+                            (amz--text "amz-key" (component--get p 'key "S")))))))
 
 (defcomponent 'amazon/hero
   "The head of a product's page: its photo large on a white tile over a blur of itself, the brand, the title, the stars, the price with the M.R.P. and the discount, when it lands, and the marks. IMAGE is the photo's file on disk."
@@ -1527,6 +1543,56 @@
   (for-each (lambda (b) (when (buffer-known? b) (list-refresh! b)))
             (list *amazon-buffer* *amazon-cart-buffer*)))
 
+(define (amazon--tabs) (or (buffer-local-value 'amazon-tabs *amazon-buffer*) '()))
+
+(define (amazon--tab-page buf query)
+  ;; the page a search's tab was left on
+  (let ((t (assoc query (or (buffer-local-value 'amazon-tabs buf) '()))))
+    (if t (cadr t) 1)))
+
+(define (amazon--tab-keep! buf query page)
+  ;; one tab per search, as (QUERY PAGE), oldest first; the eleventh pushes the oldest out
+  (let* ((tabs (or (buffer-local-value 'amazon-tabs buf) '()))
+         (tabs (if (assoc query tabs)
+                   (map (lambda (t) (if (equal? (car t) query) (list query page) t)) tabs)
+                   (append tabs (list (list query page)))))
+         (tabs (if (> (length tabs) 10) (cdr tabs) tabs)))
+    (buffer-set-local! buf 'amazon-tabs tabs)))
+
+(define (amazon--tab-blocks)
+  ;; the searches as tabs over the results; imenu lists them, a click takes one,
+  ;; and a search still being read wears …
+  (let ((tabs (amazon--tabs))
+        (now (buffer-local-value 'amazon-query *amazon-buffer*)))
+    (and (pair? tabs)
+         (component 'ui/tabs
+           (list 'class "amz-searches"
+                 'tabs (map (lambda (t)
+                              (let ((i (- (length tabs) (length (member t tabs)))))
+                                (append (list (string-append "amazon-tab:" (car t))
+                                              (if (amazon--cached *amazon-searches* (amazon--search-key (car t) (cadr t)))
+                                                  (car t)
+                                                  (string-append (car t) " …"))
+                                              (equal? (car t) now))
+                                        ;; the first five take the digits 1 to 5
+                                        (if (< i 5) (list (number->string (+ i 1))) '()))))
+                            tabs))))))
+
+(define (amazon--tab-nth! n)
+  (let ((tabs (amazon--tabs)))
+    (if (> n (length tabs))
+        (message (string-append "No search " (number->string n)))
+        (amazon--tab-take! (car (list-ref tabs (- n 1)))))))
+
+(for-each (lambda (n)
+            (define-command (string-append "amazon-search-tab-" (number->string n))
+              (string-append "Show search " (number->string n) " of the results")
+              (lambda () (amazon--tab-nth! n))))
+          '(1 2 3 4 5))
+
+(define (amazon--tab-take! query)
+  (amazon-open-page! query (amazon--tab-page *amazon-buffer* query) #f))
+
 (define (amazon--list-head buf)
   ;; the search bar, then the shelf: what you searched, or the cart, and where you are in it
   (let* ((cart? (equal? buf *amazon-cart-buffer*))
@@ -1534,6 +1600,7 @@
          (n (length (site-app-rows buf))))
     (filter pair? (list (component 'amazon/search-bar (list 'query (or *amazon-typing* query) 'active? (and *amazon-typing* #t)
                                               'click "amazon:amazon-search" 'key "/"))
+          (if cart? #f (amazon--tab-blocks))
           (list 'tag "div" 'class "amz-shelf"
                 'children (list (amz--text "amz-shelf-title" (cond (cart? "Your cart") ((equal? query "") "Amazon") (else query)))
                                 (amz--text "amz-shelf-meta"
@@ -1555,6 +1622,7 @@
     (let ((row (and (site-app-get buf 'data) (site-app-get buf 'row))))
       (cond ((not (string? id)) #f)
             ((string-prefix? "amazon:" id) (run-command (substring id 7 (string-length id))) #t)
+            ((string-prefix? "amazon-tab:" id) (amazon--tab-take! (substring id 11 (string-length id))) #t)
             ((string-prefix? "amazon-remove:" id)
              (let ((hit (amazon-row-by-asin (substring id 14 (string-length id)))))
                (when hit (amazon-cart-remove! hit))
@@ -1638,6 +1706,8 @@
 
 (define (amazon--section id label key path wait kind keys columns)
   (list 'id id 'label label 'key key 'path path
+        ;; the letter after SPC that takes the section: SPC r the results, SPC c the cart
+        'shortcut (if (eq? id 'cart) "c" "r")
         'live #t 'wait wait
         'after-fill (lambda (buf rows) (amazon--filled! buf rows))
         'row (lambda (buf row) (amazon--card buf row))
@@ -1658,6 +1728,8 @@
         ;; every page is amazon-detail-mode, each kind a mode derived from it
         'detail-mode "amazon-detail-mode"
         'own-group #t
+        ;; the sections take SPC and a letter; the digits are the searches'
+        'section-leader "SPC"
         ;; a tab already on the store is the app's tab
         'adopt #t
         'navigate (lambda (name url wait k) (amazon--navigate! url wait k))
@@ -1691,24 +1763,32 @@
 
 ;; each section's own keys, on top of amazon-mode's
 (minor-mode-keys! "amazon-results-mode"
-  (list (list "/" "amazon-search") (list "n" "amazon-next-page") (list "p" "amazon-prev-page")
+  (list (list "1" "amazon-search-tab-1") (list "2" "amazon-search-tab-2") (list "3" "amazon-search-tab-3")
+        (list "4" "amazon-search-tab-4") (list "5" "amazon-search-tab-5")
+        (list "/" "list-filter") (list "S" "amazon-search") (list "n" "amazon-next-page") (list "p" "amazon-prev-page")
         (list "x" "amazon-hide") (list "X" "amazon-hidden") (list "d" "amazon-sort-delivery")
         (list "g" "amazon-refresh")))
 (minor-mode-keys! "amazon-cart-mode"
-  (list (list "/" "amazon-search") (list "C" "amazon-results")
+  (list (list "/" "list-filter") (list "S" "amazon-search") (list "C" "amazon-results")
         (list "c" "amazon-cart-remove") (list "u" "amazon-cart-restore")))
 
 ;; a page reads its product again; its other keys are its kind's
-(mode-keys! "amazon-detail-mode" (list (list "g" "amazon-reload-detail") (list "/" "amazon-search")))
+(mode-keys! "amazon-detail-mode" (list (list "g" "amazon-reload-detail") (list "S" "amazon-search")))
+;; SPC leads to the sections: SPC r the results, SPC c the cart. It takes over
+;; list-toggle-mark, which nothing in the app reads
+(define-keymap! "amazon-leader-map")
+(define-key "amazon-leader-map" "r" "site-app-tab-1")
+(define-key "amazon-leader-map" "c" "site-app-tab-2")
+(bind-prefix! (mode-keymap "amazon-mode") "SPC" "amazon-leader-map")
 
 (mode-doc! "amazon-mode"
-  "Amazon as the signed-in account sees it, with the retail price beside the one you pay. Every index is this mode: the search results and the cart are each a section with a mode of its own on it. Moving shows that product as a page beside the list, and C-` there flips through the pages you have opened. M-1 shows the results and M-2 the cart, s picks one; RET shows the page again, c adds the product to the cart, m saves it and marks the row, N writes a note on it, w copies its link, C opens the cart, digits switch the tabs of the page beside the list, M-↑ and M-↓ walk its parts, q quits.")
+  "Amazon as the signed-in account sees it, with the retail price beside the one you pay. Every index is this mode: the search results and the cart are each a section with a mode of its own on it. Moving shows that product as a page beside the list, and C-` there flips through the pages you have opened. SPC r shows the results and SPC c the cart, s picks one; in the results 1 to 5 take the first five searches; RET shows the page again, c adds the product to the cart, m saves it and marks the row, N writes a note on it, w copies its link, C opens the cart, 6 to 0 switch the tabs of the page beside the list, M-↑ and M-↓ walk its parts, q quits.")
 (mode-doc! "amazon-results-mode"
-  "The results of one search. / runs another, n and p walk to the next and previous page of results, d orders them by the soonest delivery, x takes a product out of the list and X shows the hidden ones again marked ⊘, g reads this page again.")
+  "The results of your searches, one tab each over the list: S runs another in a new tab, / filters the rows, 1 to 5 take the first five, imenu or a click takes any, and a search still being read wears … while you look at another. The last ten searches keep their tabs. n and p walk to the next and previous page of results, d orders them by the soonest delivery, x takes a product out of the list and X shows the hidden ones again marked ⊘, g reads this page again.")
 (mode-doc! "amazon-cart-mode"
-  "What the cart holds: the lines you are buying, not the ones saved for later. c takes a line out of the cart, and u puts the last one taken out back in, one of it; u again goes further back. What was taken out is kept until the editor restarts. g reads the cart again, C goes back to the results, / searches.")
+  "What the cart holds: the lines you are buying, not the ones saved for later. c takes a line out of the cart, and u puts the last one taken out back in, one of it; u again goes further back. What was taken out is kept until the editor restarts. g reads the cart again, C goes back to the results, S searches, / filters the rows.")
 (mode-doc! "amazon-detail-mode"
-  "One Amazon page beside its list. 1, 2 and 3 switch the Overview, Specs and Reviews tabs; c adds the product to the cart, m saves it and marks it in the list, N writes a note that stays on this page, w copies its link, o opens it on the site, g reads the product page again, q puts it away. C-` walks the other pages opened from the list, C-M-` walks back, and M-RET keeps this one so the next row opens a fresh page.")
+  "One Amazon page beside its list. 6, 7 and 8 switch the Overview, Specs and Reviews tabs, and 1 and 2 take the results and the cart; c adds the product to the cart, m saves it and marks it in the list, N writes a note that stays on this page, w copies its link, o opens it on the site, g reads the product page again, S searches, q puts it away. C-` walks the other pages opened from the list, C-M-` walks back, and M-RET keeps this one so the next row opens a fresh page.")
 (mode-doc! "amazon-product-mode"
   "A product from the search results, as its own page. Its keys are amazon-detail-mode's.")
 (mode-doc! "amazon-cart-item-mode"
@@ -1782,9 +1862,11 @@
   (when first? (frame-tab! (amazon-home-group!)))
   (let ((buf (amazon--section! 'results)))
     (buffer-set-local! buf 'amazon-query query)
+    (amazon--tab-keep! buf query page)
     (let* ((hit (amazon--cached *amazon-searches* (amazon--search-key query page)))
+           ;; still the tab on screen, at this page: a search read behind another fills only its own tab
            (here? (lambda () (and (equal? (buffer-local-value 'amazon-query buf) query)
-                                  (equal? (amazon-page) page))))
+                                  (equal? (amazon--tab-page buf query) page))))
            (fill! (lambda (rows next)
                     (buffer-set-local! buf 'amazon-page page)
                     (buffer-set-local! buf 'amazon-more (and next #t))
@@ -1802,14 +1884,16 @@
       ;; what this search found last time draws now; the site is read behind it
       (if hit
           (fill! (plist-get hit 'rows) (plist-get hit 'more))
-          (message (string-append "Amazon: " query
-                                  (if (> page 1) (string-append " page " (number->string page)) "")
-                                  "...")))
+          (begin
+            (list-refresh! buf)
+            (message (string-append "Amazon: " query
+                                    (if (> page 1) (string-append " page " (number->string page)) "")
+                                    "..."))))
       (amazon-fetch-page! query page
         (lambda (rows next)
           (cond ((pair? rows)
                  (amazon--search-keep! query page rows next)
-                 (cond ((not hit) (fill! rows next))
+                 (cond ((not hit) (if (here?) (fill! rows next) (list-refresh! buf)))
                        ((and (here?) (not (equal? rows (plist-get hit 'rows))))
                         (buffer-set-local! buf 'amazon-more (and next #t))
                         (amazon--fill! buf rows)))

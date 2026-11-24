@@ -212,7 +212,9 @@
     (cons (list "Sections" "sa-sections"
                 (map (lambda (i)
                        (let* ((t (list-ref sections i))
-                              (key (or (tab-bars-key 'index i) (and (> (length t) 3) (list-ref t 3)))))
+                              (own (and (> (length t) 3) (list-ref t 3)))
+                              ;; with a 'section-leader, each section keeps its own letter after the leader
+                              (key (if (plist-get spec 'section-leader) own (or (tab-bars-key 'index i) own))))
                          (append (list (car t) (cadr t) (list-ref t 2)) (if key (list key) '()))))
                      (iota (length sections))))
           (map (lambda (group)
@@ -241,8 +243,10 @@
 
 (define (site-app-list-head-blocks buf)
   ;; the sections bar, in the window's header line as the todos keep their views
-  (let ((bar (car (site-app-index-bars buf))))
-    (list (component 'ui/tabs (list 'class (cadr bar) 'tabs (caddr bar))))))
+  (let ((bar (car (site-app-index-bars buf)))
+        (leader (plist-get (site-app-get buf 'spec) 'section-leader)))
+    (list (component 'ui/tabs (append (list 'class (cadr bar) 'tabs (caddr bar))
+                                      (if leader (list 'leader leader) '()))))))
 
 (define (site-app-stars text &optional confirmed?)
   ;; a rating in any shape the sheets give it, "4", "3.5", "★★★" or "★★★✓",
@@ -300,7 +304,10 @@
          ;; the keys the sections bar binds, 1 to 5, so the header names the same ones
          (nav (string-join
                 (map (lambda (tab)
-                       (mark (if (> (length tab) 3) (string-append (list-ref tab 3) " " (cadr tab)) (cadr tab))
+                       (mark (if (> (length tab) 3)
+                                 (string-append (let ((l (plist-get spec 'section-leader))) (if l (string-append l " ") ""))
+                                                (list-ref tab 3) " " (cadr tab))
+                                 (cadr tab))
                              (caddr tab)))
                      (caddr (car (site-app-index-bars buf))))
                 " "))
